@@ -1,16 +1,12 @@
 local access = require("kong.plugins.soap-request-transformer.access")
-local kong = kong
-local get_raw_body = kong.request.get_raw_body
-local set_raw_body = kong.service.request.set_raw_body
-local get_header = kong.request.get_header
-local set_header = kong.service.request.set_header
-local handler = require("xmlhandler.tree")
-local xml2lua = require("xml2lua")
+local pretty = require("pl.pretty")
 local concat = table.concat
+local soap = require("soap")
 local cjson = require("cjson")
-
-local CONTENT_TYPE = "content-type"
-local CONTENT_LENGTH = "content-length"
+local xml2lua = require("xml2lua")
+local handler = require("xmlhandler.tree")
+local insert = table.insert
+local remove = table.remove
 
 local SoapTransformerHandler = {
     VERSION = "0.0.1",
@@ -28,35 +24,8 @@ local function remove_attr_tags(e)
     end
 end
 
-
-
-function SoapTransformerHandler.convertXMLtoJSON(xml, conf)
-    local xmlHandler = handler:new()
-    local parser = xml2lua.parser( xmlHandler )
-    parser:parse(xml)
-    local SOAPPrefix = "SOAP-ENV"
-    if string.match(xml,"soapenv:Envelope") then
-        SOAPPrefix = "soapenv"
-    end
-
-    local t = xmlHandler.root[SOAPPrefix .. ":Envelope"][SOAPPrefix .. ":Body"]
-    if conf.remove_attr_tags then
-        remove_attr_tags(t)
-    end
-
-    return cjson.encode(t)
-end
-
 function SoapTransformerHandler:access(conf)
-    local body = get_raw_body()
-    local is_body_transformed, body = access.transform_body(conf, body,get_header(CONTENT_TYPE))
-
-    if is_body_transformed then
-        set_raw_body(body)
-        set_header(CONTENT_LENGTH, #body)
-        set_header(CONTENT_TYPE, "text/xml;charset=UTF-8")
-    end
-
+    access.execute(conf)
 end
 
 function SoapTransformerHandler:header_filter(conf)
@@ -71,29 +40,21 @@ function SoapTransformerHandler:body_filter(conf)
     ctx.rt_body_chunks = ctx.rt_body_chunks or {}
     ctx.rt_body_chunk_number = ctx.rt_body_chunk_number or 1
 
-    -- if eof wasn't received keep buffering
-    if not eof then
+    if eof then
+        local chunks = concat(ctx.rt_body_chunks)
+        local parser = xml2lua.parser(handler)
+        parser:parse(chunks)
+        local t = handler.root["SOAP-ENV:Envelope"]["SOAP-ENV:Body"]
+        if conf.remove_attr_tags then
+            remove_attr_tags(t)
+        end
+
+        ngx.arg[1] = cjson.encode(t)
+    else
         ctx.rt_body_chunks[ctx.rt_body_chunk_number] = chunk
         ctx.rt_body_chunk_number = ctx.rt_body_chunk_number + 1
         ngx.arg[1] = nil
-        return
     end
-
-    -- if bad gateway status recieved return
-    if kong.response.get_status() == 502 then
-        return nil
-    end
-
-    -- last piece of body is ready
-    local resp_body = concat(ctx.rt_body_chunks)
-
-    if not resp_body or resp_body == '' then
-        return nil
-    end
-
-    kong.log.debug("Response body XML: "..resp_body)
-    ngx.arg[1] = self.convertXMLtoJSON(resp_body, conf)
-    kong.log.debug("Response body JSON: "..ngx.arg[1])
 end
 
 
